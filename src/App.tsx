@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import './App.css'
+import { supabase } from './supabase'
 
 type ColumnId = 'backlog' | 'in-progress' | 'done'
 
@@ -24,14 +25,22 @@ interface Task {
   tags: TagId[]
 }
 
+type SupabaseTaskRow = {
+  id: string
+  title: string | null
+  description: string | null
+  status: string | null
+  priority: string | null
+  deadline: string | null
+  created_at: string | null
+  tags: string | null
+}
+
 const COLUMN_CONFIG: { id: ColumnId; title: string }[] = [
   { id: 'backlog', title: 'Backlog' },
   { id: 'in-progress', title: 'In Progress' },
   { id: 'done', title: 'Done' },
 ]
-
-const STORAGE_KEY = 'kanban_tasks_v2'
-const TAGS_STORAGE_KEY = 'kanban_tags_v1'
 
 function getRandomColorFromString(seed: string) {
   let hash = 0
@@ -43,53 +52,45 @@ function getRandomColorFromString(seed: string) {
   return `hsl(${hue} 70% 80%)`
 }
 
-function loadTasks(): Task[] {
-  if (typeof window === 'undefined') return []
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY)
-    if (!raw) return []
-    const parsed = JSON.parse(raw) as Task[]
-    if (!Array.isArray(parsed)) return []
-    return parsed
-  } catch {
-    return []
-  }
+function parseTagsFromText(value: string | null): TagId[] {
+  if (!value) return []
+  return value
+    .split(',')
+    .map((t) => t.trim())
+    .filter(Boolean)
 }
 
-function saveTasks(tasks: Task[]) {
-  if (typeof window === 'undefined') return
-  try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(tasks))
-  } catch {
-    // ignore storage errors
-  }
+function stringifyTagsToText(tags: TagId[]): string {
+  if (!tags.length) return ''
+  return tags.join(',')
 }
 
-function loadTags(): Tag[] {
-  if (typeof window === 'undefined') return []
-  try {
-    const raw = window.localStorage.getItem(TAGS_STORAGE_KEY)
-    if (!raw) return []
-    const parsed = JSON.parse(raw) as Tag[]
-    if (!Array.isArray(parsed)) return []
-    return parsed
-  } catch {
-    return []
-  }
-}
+function mapRowToTask(row: SupabaseTaskRow): Task {
+  const column =
+    (row.status as ColumnId | null) && ['backlog', 'in-progress', 'done'].includes(row.status ?? '')
+      ? (row.status as ColumnId)
+      : 'backlog'
 
-function saveTags(tags: Tag[]) {
-  if (typeof window === 'undefined') return
-  try {
-    window.localStorage.setItem(TAGS_STORAGE_KEY, JSON.stringify(tags))
-  } catch {
-    // ignore storage errors
+  const priority =
+    (row.priority as Priority | null) && ['low', 'medium', 'high'].includes(row.priority ?? '')
+      ? (row.priority as Priority)
+      : 'medium'
+
+  return {
+    id: row.id,
+    title: row.title ?? '',
+    description: row.description ?? '',
+    priority,
+    deadline: row.deadline ? row.deadline.slice(0, 10) : '',
+    column,
+    createdAt: row.created_at ? new Date(row.created_at).getTime() : Date.now(),
+    tags: parseTagsFromText(row.tags),
   }
 }
 
 function App() {
-  const [tasks, setTasks] = useState<Task[]>(() => loadTasks())
-  const [tags, setTags] = useState<Tag[]>(() => loadTags())
+  const [tasks, setTasks] = useState<Task[]>([])
+  const [tags, setTags] = useState<Tag[]>([])
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
   const [priority, setPriority] = useState<Priority>('medium')
@@ -103,26 +104,50 @@ function App() {
   const [draggingId, setDraggingId] = useState<string | null>(null)
 
   useEffect(() => {
-    saveTasks(tasks)
-  }, [tasks])
+    async function loadFromSupabase() {
+      const { data, error } = await supabase
+        .from('tasks')
+        .select('*')
+        .order('created_at', { ascending: true })
 
-  useEffect(() => {
-    saveTags(tags)
-  }, [tags])
+      if (error) {
+        // eslint-disable-next-line no-console
+        console.error('Failed to load tasks from Supabase', error)
+        return
+      }
 
-  useEffect(() => {
-    if (!tasks.length) {
-      setTags([])
-      setFilterTagIds([])
-      return
+      const rows = (data ?? []) as SupabaseTaskRow[]
+      const loadedTasks = rows.map(mapRowToTask)
+      setTasks(loadedTasks)
     }
+
+    loadFromSupabase()
+  }, [])
+
+  useEffect(() => {
     const usedTagIds = new Set<TagId>()
     tasks.forEach((task) => {
       task.tags?.forEach((id) => {
         usedTagIds.add(id)
       })
     })
-    setTags((prev) => prev.filter((tag) => usedTagIds.has(tag.id)))
+
+    const nextTags: Tag[] = Array.from(usedTagIds).map((id) => ({
+      id,
+      name: id,
+      color: getRandomColorFromString(id),
+    }))
+
+    setTags((prev) => {
+      if (prev.length === nextTags.length) {
+        const same = prev.every((tag) =>
+          nextTags.some((next) => next.id === tag.id && next.color === tag.color),
+        )
+        if (same) return prev
+      }
+      return nextTags
+    })
+
     setFilterTagIds((prev) => prev.filter((id) => usedTagIds.has(id)))
   }, [tasks])
 
@@ -161,11 +186,28 @@ function App() {
     setEditingId(null)
   }
 
-  function handleSubmit(event: React.FormEvent) {
+  async function handleSubmit(event: React.FormEvent) {
     event.preventDefault()
     if (!title.trim()) return
 
     if (editingId) {
+      const { error } = await supabase
+        .from('tasks')
+        .update({
+          title: title.trim(),
+          description: description.trim(),
+          priority,
+          deadline: deadline ? new Date(deadline).toISOString() : null,
+          tags: stringifyTagsToText(selectedTagIds),
+        })
+        .eq('id', editingId)
+
+      if (error) {
+        // eslint-disable-next-line no-console
+        console.error('Failed to update task', error)
+        return
+      }
+
       setTasks((prev) =>
         prev.map((task) =>
           task.id === editingId
@@ -185,24 +227,42 @@ function App() {
       return
     }
 
-    const newTask: Task = {
-      id: crypto.randomUUID(),
-      title: title.trim(),
-      description: description.trim(),
-      priority,
-      deadline,
-      column: 'backlog',
-      createdAt: Date.now(),
-      tags: selectedTagIds,
+    const { data, error } = await supabase
+      .from('tasks')
+      .insert({
+        title: title.trim(),
+        description: description.trim(),
+        priority,
+        status: 'backlog',
+        deadline: deadline ? new Date(deadline).toISOString() : null,
+        tags: stringifyTagsToText(selectedTagIds),
+      })
+      .select('*')
+      .single()
+
+    if (error || !data) {
+      // eslint-disable-next-line no-console
+      console.error('Failed to create task', error)
+      return
     }
 
-    setTasks((prev) => [...prev, newTask])
+    const created = mapRowToTask(data as SupabaseTaskRow)
+    setTasks((prev) => [...prev, created])
     resetForm()
     setIsFormOpen(false)
   }
 
-  function handleDeleteCurrent() {
+  async function handleDeleteCurrent() {
     if (!editingId) return
+
+    const { error } = await supabase.from('tasks').delete().eq('id', editingId)
+
+    if (error) {
+      // eslint-disable-next-line no-console
+      console.error('Failed to delete task', error)
+      return
+    }
+
     setTasks((prev) => prev.filter((task) => task.id !== editingId))
     resetForm()
     setIsFormOpen(false)
@@ -231,9 +291,9 @@ function App() {
       return
     }
     const newTag: Tag = {
-      id: crypto.randomUUID(),
+      id: trimmed,
       name: trimmed,
-      color: getRandomColorFromString(trimmed + Date.now().toString()),
+      color: getRandomColorFromString(trimmed),
     }
     setTags((prev) => [...prev, newTag])
     setSelectedTagIds((prev) => [...prev, newTag.id])
@@ -283,7 +343,7 @@ function App() {
     setDraggingId(null)
   }
 
-  function handleDrop(event: React.DragEvent<HTMLElement>, column: ColumnId) {
+  async function handleDrop(event: React.DragEvent<HTMLElement>, column: ColumnId) {
     event.preventDefault()
     const id = event.dataTransfer.getData('text/plain')
     if (!id) return
@@ -291,6 +351,16 @@ function App() {
     setTasks((prev) =>
       prev.map((task) => (task.id === id ? { ...task, column } : task)),
     )
+
+    const { error } = await supabase
+      .from('tasks')
+      .update({ status: column })
+      .eq('id', id)
+
+    if (error) {
+      // eslint-disable-next-line no-console
+      console.error('Failed to move task', error)
+    }
     setDraggingId(null)
   }
 
