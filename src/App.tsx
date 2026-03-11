@@ -5,6 +5,14 @@ type ColumnId = 'backlog' | 'in-progress' | 'done'
 
 type Priority = 'low' | 'medium' | 'high'
 
+type TagId = string
+
+interface Tag {
+  id: TagId
+  name: string
+  color: string
+}
+
 interface Task {
   id: string
   title: string
@@ -13,6 +21,7 @@ interface Task {
   deadline: string
   column: ColumnId
   createdAt: number
+  tags: TagId[]
 }
 
 const COLUMN_CONFIG: { id: ColumnId; title: string }[] = [
@@ -21,7 +30,18 @@ const COLUMN_CONFIG: { id: ColumnId; title: string }[] = [
   { id: 'done', title: 'Done' },
 ]
 
-const STORAGE_KEY = 'kanban_tasks_v1'
+const STORAGE_KEY = 'kanban_tasks_v2'
+const TAGS_STORAGE_KEY = 'kanban_tags_v1'
+
+function getRandomColorFromString(seed: string) {
+  let hash = 0
+  for (let i = 0; i < seed.length; i += 1) {
+    // eslint-disable-next-line no-bitwise
+    hash = seed.charCodeAt(i) + ((hash << 5) - hash)
+  }
+  const hue = Math.abs(hash) % 360
+  return `hsl(${hue} 70% 80%)`
+}
 
 function loadTasks(): Task[] {
   if (typeof window === 'undefined') return []
@@ -45,12 +65,39 @@ function saveTasks(tasks: Task[]) {
   }
 }
 
+function loadTags(): Tag[] {
+  if (typeof window === 'undefined') return []
+  try {
+    const raw = window.localStorage.getItem(TAGS_STORAGE_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw) as Tag[]
+    if (!Array.isArray(parsed)) return []
+    return parsed
+  } catch {
+    return []
+  }
+}
+
+function saveTags(tags: Tag[]) {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(TAGS_STORAGE_KEY, JSON.stringify(tags))
+  } catch {
+    // ignore storage errors
+  }
+}
+
 function App() {
   const [tasks, setTasks] = useState<Task[]>(() => loadTasks())
+  const [tags, setTags] = useState<Tag[]>(() => loadTags())
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
   const [priority, setPriority] = useState<Priority>('medium')
   const [deadline, setDeadline] = useState('')
+  const [tagInput, setTagInput] = useState('')
+  const [selectedTagIds, setSelectedTagIds] = useState<TagId[]>([])
+  const [filterTagIds, setFilterTagIds] = useState<TagId[]>([])
+  const [isTagDropdownOpen, setIsTagDropdownOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [isFormOpen, setIsFormOpen] = useState(false)
   const [draggingId, setDraggingId] = useState<string | null>(null)
@@ -59,18 +106,48 @@ function App() {
     saveTasks(tasks)
   }, [tasks])
 
+  useEffect(() => {
+    saveTags(tags)
+  }, [tags])
+
+  useEffect(() => {
+    if (!tasks.length) {
+      setTags([])
+      setFilterTagIds([])
+      return
+    }
+    const usedTagIds = new Set<TagId>()
+    tasks.forEach((task) => {
+      task.tags?.forEach((id) => {
+        usedTagIds.add(id)
+      })
+    })
+    setTags((prev) => prev.filter((tag) => usedTagIds.has(tag.id)))
+    setFilterTagIds((prev) => prev.filter((id) => usedTagIds.has(id)))
+  }, [tasks])
+
+  const tasksForBoard = useMemo(() => {
+    if (!filterTagIds.length) return tasks
+    return tasks.filter((task) =>
+      filterTagIds.every((tagId) => task.tags.includes(tagId)),
+    )
+  }, [tasks, filterTagIds])
+
   const tasksByColumn = useMemo(
     () =>
       COLUMN_CONFIG.reduce(
-        (acc, col) => ({
-          ...acc,
-          [col.id]: tasks
+        (acc, col) => {
+          const columnTasks = tasksForBoard
             .filter((t) => t.column === col.id)
-            .sort((a, b) => a.createdAt - b.createdAt),
-        }),
+            .sort((a, b) => a.createdAt - b.createdAt)
+          return {
+            ...acc,
+            [col.id]: columnTasks,
+          }
+        },
         {} as Record<ColumnId, Task[]>,
       ),
-    [tasks],
+    [tasksForBoard],
   )
 
   function resetForm() {
@@ -78,6 +155,9 @@ function App() {
     setDescription('')
     setPriority('medium')
     setDeadline('')
+    setTagInput('')
+    setSelectedTagIds([])
+    setIsTagDropdownOpen(false)
     setEditingId(null)
   }
 
@@ -95,6 +175,7 @@ function App() {
                 description: description.trim(),
                 priority,
                 deadline,
+                tags: selectedTagIds,
               }
             : task,
         ),
@@ -112,6 +193,7 @@ function App() {
       deadline,
       column: 'backlog',
       createdAt: Date.now(),
+      tags: selectedTagIds,
     }
 
     setTasks((prev) => [...prev, newTask])
@@ -132,8 +214,59 @@ function App() {
     setDescription(task.description)
     setPriority(task.priority)
     setDeadline(task.deadline)
+    setSelectedTagIds(task.tags ?? [])
     setIsFormOpen(true)
   }
+
+  function handleAddTagByName(name: string) {
+    const trimmed = name.trim()
+    if (!trimmed) return
+    const existing = tags.find(
+      (tag) => tag.name.toLowerCase() === trimmed.toLowerCase(),
+    )
+    if (existing) {
+      setSelectedTagIds((prev) =>
+        prev.includes(existing.id) ? prev : [...prev, existing.id],
+      )
+      return
+    }
+    const newTag: Tag = {
+      id: crypto.randomUUID(),
+      name: trimmed,
+      color: getRandomColorFromString(trimmed + Date.now().toString()),
+    }
+    setTags((prev) => [...prev, newTag])
+    setSelectedTagIds((prev) => [...prev, newTag.id])
+  }
+
+  function handleTagInputKeyDown(event: React.KeyboardEvent<HTMLInputElement>) {
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      if (!tagInput.trim()) return
+      handleAddTagByName(tagInput)
+      setTagInput('')
+      setIsTagDropdownOpen(false)
+    }
+  }
+
+  function toggleTagSelection(id: TagId) {
+    setSelectedTagIds((prev) =>
+      prev.includes(id) ? prev.filter((t) => t !== id) : [...prev, id],
+    )
+  }
+
+  function toggleFilterTag(id: TagId) {
+    setFilterTagIds((prev) =>
+      prev.includes(id) ? prev.filter((t) => t !== id) : [...prev, id],
+    )
+  }
+
+  const selectedTags = useMemo(
+    () => tags.filter((tag) => selectedTagIds.includes(tag.id)),
+    [tags, selectedTagIds],
+  )
+
+  const hasActiveFilters = filterTagIds.length > 0
 
   function handleCreateButtonClick() {
     resetForm()
@@ -195,6 +328,36 @@ function App() {
           >
             + Create task
           </button>
+        </div>
+      )}
+
+      {!!tags.length && (
+        <div className="tag-filter-row">
+          <span className="tag-filter-label">Filter by tags:</span>
+          <div className="tag-filter-list">
+            {tags.map((tag) => (
+              <button
+                key={tag.id}
+                type="button"
+                className={`tag-filter-chip ${
+                  filterTagIds.includes(tag.id) ? 'tag-filter-chip-active' : ''
+                }`}
+                style={{ backgroundColor: tag.color }}
+                onClick={() => toggleFilterTag(tag.id)}
+              >
+                {tag.name}
+              </button>
+            ))}
+            {hasActiveFilters && (
+              <button
+                type="button"
+                className="tag-filter-clear"
+                onClick={() => setFilterTagIds([])}
+              >
+                Clear
+              </button>
+            )}
+          </div>
         </div>
       )}
 
@@ -263,6 +426,70 @@ function App() {
                   value={deadline}
                   onChange={(e) => setDeadline(e.target.value)}
                 />
+              </label>
+            </div>
+
+            <div className="task-form-row">
+              <label className="task-label">
+                <span>Tags</span>
+                <div className="tag-input-wrapper">
+                  <div className="tag-selected-list">
+                    {selectedTags.map((tag) => (
+                      <button
+                        key={tag.id}
+                        type="button"
+                        className="tag-chip"
+                        style={{ backgroundColor: tag.color }}
+                        onClick={() => toggleTagSelection(tag.id)}
+                      >
+                        {tag.name}
+                      </button>
+                    ))}
+                    {!selectedTags.length && (
+                      <span className="tag-placeholder">
+                        Add or select tags
+                      </span>
+                    )}
+                  </div>
+                  <div className="tag-input-row">
+                    <input
+                      type="text"
+                      value={tagInput}
+                      onChange={(e) => setTagInput(e.target.value)}
+                      onKeyDown={handleTagInputKeyDown}
+                      placeholder="Type tag and press Enter"
+                      onFocus={() => setIsTagDropdownOpen(true)}
+                    />
+                    <button
+                      type="button"
+                      className="secondary-button tag-dropdown-toggle"
+                      onClick={() =>
+                        setIsTagDropdownOpen((prev) => !prev)
+                      }
+                    >
+                      ▼
+                    </button>
+                  </div>
+                  {isTagDropdownOpen && !!tags.length && (
+                    <div className="tag-dropdown">
+                      {tags.map((tag) => (
+                        <button
+                          key={tag.id}
+                          type="button"
+                          className={`tag-dropdown-item ${
+                            selectedTagIds.includes(tag.id)
+                              ? 'tag-dropdown-item-selected'
+                              : ''
+                          }`}
+                          style={{ backgroundColor: tag.color }}
+                          onClick={() => toggleTagSelection(tag.id)}
+                        >
+                          {tag.name}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </label>
             </div>
 
@@ -337,6 +564,22 @@ function App() {
                         <span className="task-deadline">
                           Due: {task.deadline}
                         </span>
+                      )}
+                      {!!task.tags?.length && (
+                        <div className="task-tags">
+                          {task.tags
+                            .map((tagId) => tags.find((tag) => tag.id === tagId))
+                            .filter(Boolean)
+                            .map((tag) => (
+                              <span
+                                key={tag!.id}
+                                className="task-tag-chip"
+                                style={{ backgroundColor: tag!.color }}
+                              >
+                                {tag!.name}
+                              </span>
+                            ))}
+                        </div>
                       )}
                     </footer>
                   </article>
